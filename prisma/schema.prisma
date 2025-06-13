@@ -1,0 +1,132 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RelationType {
+  FATHER
+  MOTHER
+  SIBLING
+  CHILD
+  SPOUSE
+}
+
+enum TreeRole {
+  VIEWER
+  EDITOR
+  ADMIN
+}
+
+enum MergeStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model User {
+  id            String       @id @default(uuid())
+  telegramId    String       @unique
+  phoneNumber   String?
+  nickname      String?
+  language      String         @default("uz")
+  familyMembers FamilyMember[]
+  treeAccess    TreeAccess[]
+  requestedMerges TreeMerge[] @relation("Requester")
+  approvedMerges  TreeMerge[] @relation("Approver")
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@map("users")
+}
+
+model Tree {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  members     FamilyMember[]
+  access      TreeAccess[]
+  invites     Invite[]
+  merges      TreeMerge[] @relation("SourceTree")
+  targetMerges TreeMerge[] @relation("TargetTree")
+
+  @@map("trees")
+}
+
+model TreeAccess {
+  id        String   @id @default(uuid())
+  treeId    String
+  userId    String
+  role      TreeRole
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tree      Tree     @relation(fields: [treeId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@unique([treeId, userId])
+  @@map("tree_access")
+}
+
+model FamilyMember {
+  id          String         @id @default(uuid())
+  fullName    String
+  birthYear   Int?
+  deathYear   Int?
+  photoUrl    String?
+  relationType RelationType
+  isPrivate   Boolean        @default(false)
+  notes       String?
+  treeId      String?
+  tree        Tree?    @relation(fields: [treeId], references: [id])
+  userId      String
+  user        User           @relation(fields: [userId], references: [id])
+  relatedTo   FamilyMember[] @relation("FamilyRelations")
+  relatedFrom FamilyMember[] @relation("FamilyRelations")
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@map("family_members")
+}
+
+model Invite {
+  id        String   @id @default(uuid())
+  treeId    String
+  role      TreeRole
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tree      Tree     @relation(fields: [treeId], references: [id])
+
+  @@index([treeId])
+  @@map("invites")
+}
+
+model TreeMerge {
+  id            String      @id @default(uuid())
+  sourceTreeId  String
+  targetTreeId  String
+  requesterId   String
+  approverId    String?
+  status        MergeStatus @default(PENDING)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  sourceTree    Tree        @relation("SourceTree", fields: [sourceTreeId], references: [id])
+  targetTree    Tree        @relation("TargetTree", fields: [targetTreeId], references: [id])
+  requester     User        @relation("Requester", fields: [requesterId], references: [id])
+  approver      User?       @relation("Approver", fields: [approverId], references: [id])
+
+  @@index([sourceTreeId])
+  @@index([targetTreeId])
+  @@map("tree_merges")
+}
