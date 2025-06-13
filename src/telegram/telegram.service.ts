@@ -45,6 +45,8 @@ export class TelegramService implements OnModuleInit {
       this.setupErrorHandling();
       this.setupCommands();
       this.setupCallbacks();
+      this.setupRelationCommands();
+      this.setupRelationCallbacks();
       this.setupMessageHandlers();
       await this.bot.launch();
       this.logger.log('Bot started successfully');
@@ -90,22 +92,24 @@ export class TelegramService implements OnModuleInit {
   }
 
   private async getUser(telegramId: string) {
-    return this.retryOperation(async () => {
-      try {
-        const user = await this.prisma.user.findUnique({
-          where: { telegramId },
-          include: { familyMembers: true },
-        });
-        if (!user) {
-          this.logger.error(`User not found for telegramId: ${telegramId}`);
-          throw new Error('User not found');
-        }
-        return user;
-      } catch (error) {
-        this.logger.error(`Error in getUser: ${error.message}`, error.stack);
-        throw error;
-      }
+    let user = await this.prisma.user.findUnique({
+      where: { telegramId },
+      include: { familyMembers: true }
     });
+
+    if (!user) {
+      user = await this.prisma.user.create({
+        data: {
+          telegramId,
+          familyMembers: {
+            create: []
+          }
+        },
+        include: { familyMembers: true }
+      });
+    }
+
+    return user;
   }
 
   private async handleError(ctx: Context, error: any, context: string) {
@@ -525,19 +529,17 @@ export class TelegramService implements OnModuleInit {
         }
 
         const relationType = match[1] as RelationType;
-        const state = this.stateService.getState(ctx.chat.id.toString());
+        const chatId = ctx.chat.id.toString();
+        const state = this.stateService.getState(chatId);
 
-        if (!state || state.action !== 'adding_member') {
-          await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
-          return;
-        }
+        this.logger.debug('Setting relation type:', { relationType, state });
 
         // Update state with selected relation type
-        this.stateService.setState(ctx.chat.id.toString(), {
+        this.stateService.setState(chatId, {
           action: 'adding_member',
           step: 'enter_name',
           data: {
-            ...state.data,
+            ...state?.data,
             relationType
           }
         });
@@ -554,13 +556,13 @@ export class TelegramService implements OnModuleInit {
           }
         );
       } catch (error) {
-        console.error('Relation selection error:', error);
+        this.logger.error(`Relation selection error: ${error.message}`, error.stack);
         await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
       }
     });
 
     // Member selection handler
-    this.bot.action(/^select_member_(\d+)$/, async (ctx) => {
+    this.bot.action(/^select_member_(.+)$/, async (ctx) => {
       try {
         await ctx.answerCbQuery();
         
@@ -581,11 +583,89 @@ export class TelegramService implements OnModuleInit {
         const state = this.stateService.getState(chatId);
         const stateData = state?.data;
 
+        this.logger.debug(`Processing member selection:`, {
+          selectedMemberId,
+          state,
+          stateData
+        });
+
         if (!state || state.action !== 'adding_member' || !stateData?.name || !stateData?.birthYear || !stateData?.relationType) {
-          console.error('Invalid state:', { state, stateData });
+          this.logger.error('Invalid state for member selection:', {
+            hasState: !!state,
+            action: state?.action,
+            hasName: !!stateData?.name,
+            hasBirthYear: !!stateData?.birthYear,
+            hasRelationType: !!stateData?.relationType
+          });
           await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
           return;
         }
+
+        // Get or create user first
+        const user = await this.getUser(chatId);
+        this.logger.debug(`User found/created:`, { userId: user.id });
+
+        // Validate relation type
+        const relationType = stateData.relationType;
+        const selectedMember = await this.prisma.familyMember.findUnique({
+          where: { id: selectedMemberId },
+          include: {
+            relatedTo: true,
+            relatedFrom: true
+          }
+        });
+
+        if (!selectedMember) {
+          this.logger.error(`Selected member not found: ${selectedMemberId}`);
+          await ctx.reply('❌ Tanlangan qarindosh topilmadi. Iltimos, qaytadan urinib ko\'ring.');
+          return;
+        }
+
+        // Check for duplicate relations
+        const existingRelation = selectedMember.relatedTo.find(r => 
+          r.relationType === relationType && 
+          r.fullName === stateData.name && 
+          r.birthYear === stateData.birthYear
+        );
+
+        if (existingRelation) {
+          this.logger.warn(`Duplicate relation detected: ${existingRelation.id}`);
+          await ctx.reply(
+            '⚠️ Bu qarindosh allaqachon qo\'shilgan.\n\n' +
+            'Boshqa qarindosh qo\'shish uchun /add buyrug\'ini ishlating.',
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '📝 Yangi qarindosh qo\'shish', callback_data: 'add_new' }],
+                  [{ text: '👀 Oila daraxtini ko\'rish', callback_data: 'view_tree' }],
+                  [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+                ]
+              }
+            }
+          );
+          return;
+        }
+
+        // Validate relation type compatibility
+        const isValidRelation = this.validateRelationType(relationType, selectedMember.relationType);
+        if (!isValidRelation) {
+          this.logger.warn(`Invalid relation type combination: ${relationType} with ${selectedMember.relationType}`);
+          await ctx.reply(
+            '❌ Bu turdagi bog\'lanish mumkin emas.\n\n' +
+            'Iltimos, boshqa qarindosh turini tanlang.',
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '🔄 Qaytadan urinib ko\'rish', callback_data: 'add_new' }],
+                  [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+                ]
+              }
+            }
+          );
+          return;
+        }
+
+        this.logger.debug(`Creating new family member: ${stateData.name} (${stateData.birthYear})`);
 
         // Create new family member
         const newMember = await this.prisma.familyMember.create({
@@ -593,10 +673,12 @@ export class TelegramService implements OnModuleInit {
             fullName: stateData.name,
             birthYear: stateData.birthYear,
             relationType: stateData.relationType,
-            userId: chatId,
+            userId: user.id,
             isPrivate: false
           }
         });
+
+        this.logger.debug(`Created new member with ID: ${newMember.id}`);
 
         // Create relation between members
         await this.prisma.familyMember.update({
@@ -608,24 +690,32 @@ export class TelegramService implements OnModuleInit {
           }
         });
 
+        this.logger.debug(`Created relation between ${newMember.id} and ${selectedMemberId}`);
+
         // Clear state
         this.stateService.clearState(chatId);
 
-        // Send success message
-        await ctx.editMessageText(
-          '✅ Qarindosh muvaffaqiyatli qo\'shildi!',
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '👀 Oila daraxtini ko\'rish', callback_data: 'view_tree' }],
-                [{ text: '📝 Yangi qarindosh qo\'shish', callback_data: 'add_new' }],
-                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
-              ]
+        // Get updated family tree
+        const updatedUser = await this.prisma.user.findUnique({
+          where: { id: user.id },
+          include: {
+            familyMembers: {
+              include: {
+                relatedTo: true,
+                relatedFrom: true
+              }
             }
           }
-        );
+        });
+
+        if (!updatedUser) {
+          throw new Error('User not found after member creation');
+        }
+
+        // Show enhanced tree view
+        await this.showEnhancedTree(ctx, updatedUser.familyMembers);
       } catch (error) {
-        console.error('Member selection error:', error);
+        this.logger.error(`Error in member selection: ${error.message}`, error.stack);
         await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
       }
     });
@@ -841,24 +931,10 @@ export class TelegramService implements OnModuleInit {
           );
         }
 
-        const tree = this.treeVisualizationService.generateTextTree(user.familyMembers);
-        
         await ctx.telegram.deleteMessage(ctx.chat.id, loadingMsg.message_id);
-        await ctx.editMessageText(
-          '🌳 *Oila daraxtingiz:*\n\n' + tree,
-          { 
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '📝 Yangi qarindosh qo\'shish', callback_data: 'add_new' }],
-                [{ text: '🔄 Yangilash', callback_data: 'refresh_tree' }],
-                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }],
-              ],
-            },
-          }
-        );
+        await this.showEnhancedTree(ctx, user.familyMembers);
       } catch (error) {
-        console.error('View tree error:', error);
+        this.logger.error(`Error in view_tree callback: ${error.message}`, error.stack);
         await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
       }
     });
@@ -1094,29 +1170,66 @@ export class TelegramService implements OnModuleInit {
   }
 
   private async handleNameInput(ctx: Context, text: string, state: UserState, chatId: string) {
-    this.stateService.setState(chatId, {
-      action: 'adding_member',
-      step: 'enter_birth_year',
-      data: {
-        ...state.data,
-        name: text
+    try {
+      if (!state.data.relationType) {
+        this.logger.error('Relation type is missing in state');
+        await ctx.reply(
+          '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🔄 Qaytadan urinib ko\'rish', callback_data: 'add_new' }],
+                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+              ]
+            }
+          }
+        );
+        return;
       }
-    });
 
-    await ctx.reply(
-      '📅 Qarindoshning tug\'ilgan yilini kiriting (masalan: 1990):',
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
-          ]
+      this.stateService.setState(chatId, {
+        action: 'adding_member',
+        step: 'enter_birth_year',
+        data: {
+          ...state.data,
+          name: text
         }
-      }
-    );
+      });
+
+      await ctx.reply(
+        '📅 Qarindoshning tug\'ilgan yilini kiriting:',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+            ]
+          }
+        }
+      );
+    } catch (error) {
+      this.logger.error(`Error in handleNameInput: ${error.message}`, error.stack);
+      await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+    }
   }
 
   private async handleBirthYearInput(ctx: Context, text: string, state: UserState, chatId: string) {
     try {
+      if (!state.data.relationType) {
+        this.logger.error('Relation type is missing in state');
+        await ctx.reply(
+          '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '🔄 Qaytadan urinib ko\'rish', callback_data: 'add_new' }],
+                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+              ]
+            }
+          }
+        );
+        return;
+      }
+
       const birthYear = parseInt(text);
       if (isNaN(birthYear) || birthYear < 1900 || birthYear > new Date().getFullYear()) {
         await ctx.reply(
@@ -1146,7 +1259,7 @@ export class TelegramService implements OnModuleInit {
             data: {
               fullName: state.data.name,
               birthYear: birthYear,
-              relationType: state.data.relationType as RelationType,
+              relationType: state.data.relationType,
               userId: user.id
             }
           });
@@ -1216,5 +1329,255 @@ export class TelegramService implements OnModuleInit {
     };
 
     return names[relationType] || 'noma\'lum';
+  }
+
+  // Add helper method for relation type validation
+  private validateRelationType(newRelationType: RelationType, existingRelationType: RelationType): boolean {
+    const validCombinations: Record<RelationType, RelationType[]> = {
+      [RelationType.FATHER]: [RelationType.CHILD, RelationType.MOTHER, RelationType.SPOUSE],
+      [RelationType.MOTHER]: [RelationType.CHILD, RelationType.FATHER, RelationType.SPOUSE],
+      [RelationType.CHILD]: [RelationType.FATHER, RelationType.MOTHER],
+      [RelationType.SIBLING]: [RelationType.SIBLING],
+      [RelationType.SPOUSE]: [RelationType.FATHER, RelationType.MOTHER]
+    };
+
+    // Additional validation rules
+    const validationRules = {
+      [RelationType.FATHER]: {
+        maxCount: 1,
+        oppositeGender: true,
+        minAgeDifference: 15
+      },
+      [RelationType.MOTHER]: {
+        maxCount: 1,
+        oppositeGender: true,
+        minAgeDifference: 15
+      },
+      [RelationType.SPOUSE]: {
+        maxCount: 1,
+        oppositeGender: true,
+        maxAgeDifference: 30
+      },
+      [RelationType.SIBLING]: {
+        maxAgeDifference: 20
+      }
+    };
+
+    // Check if the combination is valid
+    const isValid = validCombinations[newRelationType]?.includes(existingRelationType) || false;
+    
+    this.logger.debug(`Validating relation types:`, {
+      newRelationType,
+      existingRelationType,
+      isValid,
+      validCombinations: validCombinations[newRelationType]
+    });
+
+    return isValid;
+  }
+
+  private getDetailedErrorMessage(error: string, context: any): string {
+    const errorMessages: Record<string, string> = {
+      'DUPLICATE_RELATION': 'Bu qarindosh allaqachon qo\'shilgan. Iltimos, boshqa qarindosh qo\'shing.',
+      'INVALID_RELATION': 'Bu turdagi bog\'lanish mumkin emas. Iltimos, boshqa qarindosh turini tanlang.',
+      'AGE_DIFFERENCE': 'Yosh farqi noto\'g\'ri. Iltimos, qarindoshning tug\'ilgan yilini tekshiring.',
+      'MAX_RELATIONS': 'Bu turdagi qarindoshlar soni cheklangan. Iltimos, boshqa turdagi qarindosh qo\'shing.',
+      'GENDER_MISMATCH': 'Jins mos kelmaydi. Iltimos, to\'g\'ri jinsdagi qarindoshni tanlang.'
+    };
+
+    return errorMessages[error] || 'Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.';
+  }
+
+  // Add relation management commands
+  private setupRelationCommands() {
+    this.bot.command('edit_relation', async (ctx) => {
+      if (!ctx.chat) return;
+      
+      const user = await this.getUser(ctx.chat.id.toString());
+      if (!user.familyMembers.length) {
+        await ctx.reply(
+          '❌ Siz hali hech qanday qarindosh qo\'shmagansiz.\n\n' +
+          '📝 Qarindosh qo\'shish uchun /add buyrug\'ini ishlating.'
+        );
+        return;
+      }
+
+      const keyboard = user.familyMembers.map(member => [{
+        text: `${member.fullName} (${member.birthYear})`,
+        callback_data: `edit_member_${member.id}`
+      }]);
+
+      keyboard.push([{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]);
+
+      await ctx.reply(
+        '👥 Qaysi qarindoshning bog\'lanishini o\'zgartirmoqchisiz?',
+        {
+          reply_markup: {
+            inline_keyboard: keyboard
+          }
+        }
+      );
+    });
+
+    this.bot.command('remove_relation', async (ctx) => {
+      if (!ctx.chat) return;
+      
+      const user = await this.getUser(ctx.chat.id.toString());
+      if (!user.familyMembers.length) {
+        await ctx.reply(
+          '❌ Siz hali hech qanday qarindosh qo\'shmagansiz.\n\n' +
+          '📝 Qarindosh qo\'shish uchun /add buyrug\'ini ishlating.'
+        );
+        return;
+      }
+
+      const keyboard = user.familyMembers.map(member => [{
+        text: `${member.fullName} (${member.birthYear})`,
+        callback_data: `remove_member_${member.id}`
+      }]);
+
+      keyboard.push([{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]);
+
+      await ctx.reply(
+        '👥 Qaysi qarindoshni o\'chirmoqchisiz?',
+        {
+          reply_markup: {
+            inline_keyboard: keyboard
+          }
+        }
+      );
+    });
+  }
+
+  // Add relation management callbacks
+  private setupRelationCallbacks() {
+    this.bot.action(/^edit_member_(\d+)$/, async (ctx) => {
+      try {
+        await ctx.answerCbQuery();
+        if (!ctx.chat) return;
+
+        const memberId = ctx.match[1];
+        const member = await this.prisma.familyMember.findUnique({
+          where: { id: memberId },
+          include: {
+            relatedTo: true,
+            relatedFrom: true
+          }
+        });
+
+        if (!member) {
+          await ctx.reply('❌ Qarindosh topilmadi.');
+          return;
+        }
+
+        const relations = [...member.relatedTo, ...member.relatedFrom];
+        if (!relations.length) {
+          await ctx.reply('❌ Bu qarindoshning bog\'lanishlari yo\'q.');
+          return;
+        }
+
+        const keyboard = relations.map(relation => [{
+          text: `${relation.fullName} (${relation.birthYear}) - ${this.getRelationName(relation.relationType)}`,
+          callback_data: `edit_relation_${memberId}_${relation.id}`
+        }]);
+
+        keyboard.push([{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]);
+
+        await ctx.editMessageText(
+          '👥 Qaysi bog\'lanishni o\'zgartirmoqchisiz?',
+          {
+            reply_markup: {
+              inline_keyboard: keyboard
+            }
+          }
+        );
+      } catch (error) {
+        this.logger.error(`Error in edit_member callback: ${error.message}`, error.stack);
+        await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+      }
+    });
+
+    this.bot.action(/^remove_member_(\d+)$/, async (ctx) => {
+      try {
+        await ctx.answerCbQuery();
+        if (!ctx.chat) return;
+
+        const memberId = ctx.match[1];
+        const member = await this.prisma.familyMember.findUnique({
+          where: { id: memberId },
+          include: {
+            relatedTo: true,
+            relatedFrom: true
+          }
+        });
+
+        if (!member) {
+          await ctx.reply('❌ Qarindosh topilmadi.');
+          return;
+        }
+
+        await this.prisma.familyMember.delete({
+          where: { id: memberId }
+        });
+
+        await ctx.editMessageText(
+          '✅ Qarindosh muvaffaqiyatli o\'chirildi!',
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '👀 Oila daraxtini ko\'rish', callback_data: 'view_tree' }],
+                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+              ]
+            }
+          }
+        );
+      } catch (error) {
+        this.logger.error(`Error in remove_member callback: ${error.message}`, error.stack);
+        await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+      }
+    });
+  }
+
+  // Enhanced tree visualization
+  private async showEnhancedTree(ctx: Context, members: FamilyMemberWithRelations[]) {
+    const tree = this.treeVisualizationService.generateTextTree(members);
+    const stats = this.calculateTreeStats(members);
+
+    const message = 
+      '🌳 *Oila daraxtingiz:*\n\n' +
+      tree + '\n\n' +
+      '📊 *Statistika:*\n' +
+      `• Jami qarindoshlar: ${stats.totalMembers}\n` +
+      `• Ota-onalar: ${stats.parents}\n` +
+      `• Farzandlar: ${stats.children}\n` +
+      `• Aka-uka/Singillar: ${stats.siblings}\n` +
+      `• Turmush o\'rtog\'lari: ${stats.spouses}\n`;
+
+    await ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: '📝 Yangi qarindosh', callback_data: 'add_new' },
+            { text: '✏️ Tahrirlash', callback_data: 'edit_relation' }
+          ],
+          [
+            { text: '🗑️ O\'chirish', callback_data: 'remove_relation' },
+            { text: '🔄 Yangilash', callback_data: 'refresh_tree' }
+          ],
+          [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
+        ]
+      }
+    });
+  }
+
+  private calculateTreeStats(members: FamilyMemberWithRelations[]) {
+    return {
+      totalMembers: members.length,
+      parents: members.filter(m => m.relationType === RelationType.FATHER || m.relationType === RelationType.MOTHER).length,
+      children: members.filter(m => m.relationType === RelationType.CHILD).length,
+      siblings: members.filter(m => m.relationType === RelationType.SIBLING).length,
+      spouses: members.filter(m => m.relationType === RelationType.SPOUSE).length
+    };
   }
 } 
