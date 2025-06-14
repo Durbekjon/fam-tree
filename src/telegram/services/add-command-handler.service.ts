@@ -17,31 +17,39 @@ export class AddCommandHandler {
     private readonly ui: UIService,
   ) {}
 
-  private async getUser(telegramId: string) {
-    let user = await this.prisma.user.findUnique({
-      where: { telegramId },
-      include: { familyMembers: true }
-    });
-
-    if (!user) {
-      user = await this.prisma.user.create({
-        data: {
-          telegramId,
-          familyMembers: {
-            create: []
-          }
-        },
-        include: { familyMembers: true }
+  private async ensureUserExists(telegramId: string): Promise<boolean> {
+    try {
+      let user = await this.prisma.user.findUnique({
+        where: { telegramId }
       });
-    }
 
-    return user;
+      if (!user) {
+        user = await this.prisma.user.create({
+          data: {
+            telegramId,
+            settings: '{}'
+          }
+        });
+        this.logger.debug(`Created new user with telegramId: ${telegramId}`);
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Failed to ensure user exists: ${error.message}`, error.stack);
+      return false;
+    }
   }
 
   async handle(ctx: Context): Promise<void> {
     try {
       const telegramId = ctx.from?.id.toString();
       if (!telegramId) return;
+
+      const userExists = await this.ensureUserExists(telegramId);
+      if (!userExists) {
+        await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+        return;
+      }
 
       // Set initial state for adding a family member
       this.stateService.setState(telegramId, {
@@ -61,6 +69,12 @@ export class AddCommandHandler {
       const telegramId = ctx.from?.id.toString();
       if (!telegramId) return;
 
+      const userExists = await this.ensureUserExists(telegramId);
+      if (!userExists) {
+        await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+        return;
+      }
+
       const state = this.stateService.getState(telegramId);
       if (!state || state.action !== 'adding_member') return;
 
@@ -70,7 +84,6 @@ export class AddCommandHandler {
       switch (state.step) {
         case 'enter_name':
           if (!state.data.relationType) {
-            // If relation type is missing, show the selection menu again
             await this.showRelationSelectionMenu(ctx);
             return;
           }
@@ -89,6 +102,12 @@ export class AddCommandHandler {
     try {
       const telegramId = ctx.from?.id.toString();
       if (!telegramId) return;
+
+      const userExists = await this.ensureUserExists(telegramId);
+      if (!userExists) {
+        await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+        return;
+      }
 
       const state = this.stateService.getState(telegramId);
       if (!state || state.action !== 'adding_member') return;
@@ -124,6 +143,12 @@ export class AddCommandHandler {
   private async showRelationSelectionMenu(ctx: Context): Promise<void> {
     const telegramId = ctx.from?.id.toString();
     if (!telegramId) return;
+
+    const userExists = await this.ensureUserExists(telegramId);
+    if (!userExists) {
+      await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+      return;
+    }
 
     // Update state to ensure we're in the correct step
     this.stateService.setState(telegramId, {
@@ -161,6 +186,12 @@ export class AddCommandHandler {
     const telegramId = ctx.from?.id.toString();
     if (!telegramId) return;
 
+    const userExists = await this.ensureUserExists(telegramId);
+    if (!userExists) {
+      await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+      return;
+    }
+
     // Update state with selected relation type
     this.stateService.setState(telegramId, {
       action: 'adding_member',
@@ -180,6 +211,12 @@ export class AddCommandHandler {
   public async handleNameInput(ctx: Context, name: string): Promise<void> {
     const telegramId = ctx.from?.id.toString();
     if (!telegramId) return;
+
+    const userExists = await this.ensureUserExists(telegramId);
+    if (!userExists) {
+      await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+      return;
+    }
 
     const state = this.stateService.getState(telegramId);
     if (!state || !state.data.relationType) {
@@ -209,6 +246,12 @@ export class AddCommandHandler {
     const telegramId = ctx.from?.id.toString();
     if (!telegramId) return;
 
+    const userExists = await this.ensureUserExists(telegramId);
+    if (!userExists) {
+      await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+      return;
+    }
+
     const state = this.stateService.getState(telegramId);
     if (!state || !state.data.relationType || !state.data.name) {
       await this.showRelationSelectionMenu(ctx);
@@ -227,13 +270,23 @@ export class AddCommandHandler {
     }
 
     try {
+      // Verify user exists one final time before creating family member
+      const user = await this.prisma.user.findUnique({
+        where: { telegramId }
+      });
+
+      if (!user) {
+        await this.ui.sendMessage(ctx, '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
+        return;
+      }
+
       // Create the family member
       const familyMember = await this.prisma.familyMember.create({
         data: {
           fullName: state.data.name,
           birthYear: year,
           relationType: state.data.relationType,
-          userId: telegramId,
+          userId: user.id, // Use the user's ID instead of telegramId
           isPrivate: false
         }
       });
@@ -250,6 +303,7 @@ export class AddCommandHandler {
       // Clear state after successful addition
       this.stateService.clearState(telegramId);
     } catch (error) {
+      this.logger.error(`Failed to create family member: ${error.message}`, error.stack);
       await this.errorHandler.handleError(ctx, error, 'adding_member');
     }
   }
