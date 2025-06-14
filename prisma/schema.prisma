@@ -38,7 +38,8 @@ model User {
   telegramId    String       @unique
   phoneNumber   String?
   nickname      String?
-  language      String         @default("uz")
+  language      String       @default("uz")
+  settings      String?      @default("{}")
   familyMembers FamilyMember[]
   treeAccess    TreeAccess[]
   requestedMerges TreeMerge[] @relation("Requester")

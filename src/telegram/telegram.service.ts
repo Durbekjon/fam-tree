@@ -11,6 +11,10 @@ import * as path from 'path';
 import { TreeMergeService } from '../services/tree-merge.service';
 import { TreeRole } from '../enums/tree-role.enum';
 import { InviteService } from '../services/invite.service';
+import { CommandHandlerFactory } from './services/command-handler-factory.service';
+import { TelegramBotError } from './errors/telegram.errors';
+import { SettingsHandler } from './services/settings-handler.service';
+import { AddCommandHandler } from './services/add-command-handler.service';
 
 type FamilyMemberWithRelations = FamilyMember & {
   relatedTo: FamilyMember[];
@@ -20,7 +24,7 @@ type FamilyMemberWithRelations = FamilyMember & {
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private readonly logger = new Logger(TelegramService.name);
-  private readonly bot: Telegraf;
+  private readonly bot: Telegraf<Context>;
   private readonly MAX_RETRIES = 3;
   private readonly RETRY_DELAY = 1000; // 1 second
 
@@ -32,10 +36,13 @@ export class TelegramService implements OnModuleInit {
     private readonly pdfExportService: PdfExportService,
     private readonly treeMergeService: TreeMergeService,
     private readonly inviteService: InviteService,
+    private readonly commandHandlerFactory: CommandHandlerFactory,
+    private readonly settingsHandler: SettingsHandler,
+    private readonly addCommandHandler: AddCommandHandler,
   ) {
     const token = this.configService.get<string>('telegram.token');
     if (!token) {
-      throw new Error('Telegram bot token is not configured');
+      throw new TelegramBotError('Telegram bot token is not configured', 'CONFIG_ERROR');
     }
     this.bot = new Telegraf(token);
   }
@@ -119,77 +126,17 @@ export class TelegramService implements OnModuleInit {
 
   private setupCommands() {
     this.bot.command('start', async (ctx) => {
-      try {
-        if (!await this.validateUser(ctx)) return;
-
-        const telegramId = ctx.from.id.toString();
-        const user = await this.retryOperation(async () => {
-          let user = await this.prisma.user.findUnique({ where: { telegramId } });
-          if (!user) {
-            user = await this.prisma.user.create({
-              data: {
-                telegramId,
-                nickname: ctx.from.username || ctx.from.first_name,
-              },
-            });
-          }
-          return user;
-        });
-
-        await ctx.reply(
-          '👋 *Assalomu alaykum! Shajara botiga xush kelibsiz*\n\n' +
-          '🌳 Oila daraxtingizni yaratish va boshqarish uchun quyidagi buyruqlardan foydalaning:\n\n' +
-          '📝 /add - Yangi qarindosh qo\'shish\n' +
-          '👀 /view - Oila daraxtini ko\'rish\n' +
-          '🔍 /search - Qarindoshlarni qidirish\n' +
-          '📤 /export - Oila daraxtini PDF formatida yuklab olish\n' +
-          '🔗 /invite - Oilangizga a\'zolarni taklif qilish\n' +
-          '🔄 /merge - Boshqa oila daraxti bilan birlashtirish\n' +
-          '❓ /help - Yordam',
-          { 
-            parse_mode: 'Markdown',
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '📝 Yangi qarindosh qo\'shish', callback_data: 'add_new' }],
-                [{ text: '👀 Oila daraxtini ko\'rish', callback_data: 'view_tree' }],
-                [{ text: '🔍 Qidirish', callback_data: 'search_members' }],
-                [{ text: '📤 PDF yuklab olish', callback_data: 'export_pdf' }],
-                [{ text: '🔗 Taklif yaratish', callback_data: 'create_invite' }],
-                [{ text: '🔄 Daraxtlarni birlashtirish', callback_data: 'merge_trees' }]
-              ],
-            },
-          }
-        );
-      } catch (error) {
-        await this.handleError(ctx, error, 'start command');
-      }
+      const handler = this.commandHandlerFactory.createHandler('start');
+      await handler.handle(ctx);
     });
 
     this.bot.command('add', async (ctx) => {
-      await ctx.reply(
-        '👥 *Qarindosh turini tanlang:*',
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '👨 Ota', callback_data: 'add_father' },
-                { text: '👩 Ona', callback_data: 'add_mother' },
-              ],
-              [
-                { text: '👥 Aka-uka/Singil', callback_data: 'add_sibling' },
-                { text: '👶 Farzand', callback_data: 'add_child' },
-              ],
-              [
-                { text: '💑 Turmush o\'rtog\'i', callback_data: 'add_spouse' },
-              ],
-              [
-                { text: '⬅️ Orqaga', callback_data: 'back_to_main' },
-              ],
-            ],
-          },
-        },
-      );
+      const handler = this.commandHandlerFactory.createHandler('add');
+      await handler.handle(ctx);
+    });
+
+    this.bot.command('settings', async (ctx) => {
+      await this.settingsHandler.handle(ctx);
     });
 
     this.bot.command('view', async (ctx) => {
@@ -255,9 +202,9 @@ export class TelegramService implements OnModuleInit {
         await ctx.reply(
           '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.',
           { 
-            parse_mode: 'Markdown',
             reply_markup: {
               inline_keyboard: [
+                [{ text: '🔄 Qaytadan urinib ko\'rish', callback_data: 'view_tree' }],
                 [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }],
               ],
             },
@@ -1142,177 +1089,120 @@ export class TelegramService implements OnModuleInit {
         await this.handleError(ctx, error, 'confirm_merge callback');
       }
     });
-  }
 
-  private setupMessageHandlers() {
-    this.bot.on('text', async (ctx) => {
-      try {
-        const chatId = this.getChatId(ctx);
-        if (!chatId) {
-          await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
-          return;
-        }
-
-        const state = this.stateService.getState(chatId);
-        if (!state || state.action !== 'adding_member') return;
-
-        const text = ctx.message.text;
-
-        if (state.step === 'enter_name') {
-          await this.handleNameInput(ctx, text, state, chatId);
-        } else if (state.step === 'enter_birth_year') {
-          await this.handleBirthYearInput(ctx, text, state, chatId);
-        }
-      } catch (error) {
-        await this.handleError(ctx, error, 'text message handler');
-      }
-    });
-  }
-
-  private async handleNameInput(ctx: Context, text: string, state: UserState, chatId: string) {
-    try {
-      if (!state.data.relationType) {
-        this.logger.error('Relation type is missing in state');
-        await ctx.reply(
-          '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.',
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '🔄 Qaytadan urinib ko\'rish', callback_data: 'add_new' }],
-                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
-              ]
-            }
-          }
-        );
-        return;
-      }
-
-      this.stateService.setState(chatId, {
-        action: 'adding_member',
-        step: 'enter_birth_year',
-        data: {
-          ...state.data,
-          name: text
-        }
-      });
-
+    // Settings callbacks
+    this.bot.action('settings', async (ctx) => {
+      if (!ctx.from) return;
+      const telegramId = ctx.from.id.toString();
+      const preferences = await this.settingsHandler.getUserPreferences(telegramId);
+      
       await ctx.reply(
-        '📅 Qarindoshning tug\'ilgan yilini kiriting:',
+        '*⚙️ Sozlamalar:*\n\n' +
+        'Matn o\'lchami: ' + this.getFontSizeLabel(preferences.fontSize) + '\n' +
+        'Ovozli yo\'riqnoma: ' + (preferences.voiceEnabled ? '✅' : '❌') + '\n' +
+        'Yuqori kontrast: ' + (preferences.highContrast ? '✅' : '❌') + '\n' +
+        'Avtomatik saqlash: ' + (preferences.autoSave ? '✅' : '❌') + '\n' +
+        'Bildirishnomalar: ' + (preferences.notifications ? '✅' : '❌'),
         {
+          parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [
+              [{ text: '📝 Matn o\'lchami', callback_data: 'font_size' }],
+              [{ text: '🎧 Ovozli yo\'riqnoma', callback_data: 'toggle_voice' }],
+              [{ text: '👁️ Yuqori kontrast', callback_data: 'toggle_contrast' }],
+              [{ text: '💾 Avtomatik saqlash', callback_data: 'toggle_autosave' }],
+              [{ text: '🔔 Bildirishnomalar', callback_data: 'toggle_notifications' }],
               [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
             ]
           }
         }
       );
-    } catch (error) {
-      this.logger.error(`Error in handleNameInput: ${error.message}`, error.stack);
-      await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
-    }
+    });
+
+    // Font size callbacks
+    this.bot.action('font_small', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'font_small');
+    });
+
+    this.bot.action('font_medium', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'font_medium');
+    });
+
+    this.bot.action('font_large', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'font_large');
+    });
+
+    // Toggle callbacks
+    this.bot.action('toggle_voice', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'toggle_voice');
+    });
+
+    this.bot.action('toggle_contrast', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'toggle_contrast');
+    });
+
+    this.bot.action('toggle_autosave', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'toggle_autosave');
+    });
+
+    this.bot.action('toggle_notifications', async (ctx) => {
+      if (!ctx.from) return;
+      await this.settingsHandler.handleCallback(ctx, 'toggle_notifications');
+    });
+
+    // Relation selection callbacks
+    this.bot.action('add_father', async (ctx) => {
+      await this.addCommandHandler.handleRelationSelection(ctx, 'FATHER');
+    });
+
+    this.bot.action('add_mother', async (ctx) => {
+      await this.addCommandHandler.handleRelationSelection(ctx, 'MOTHER');
+    });
+
+    this.bot.action('add_sibling', async (ctx) => {
+      await this.addCommandHandler.handleRelationSelection(ctx, 'SIBLING');
+    });
+
+    this.bot.action('add_child', async (ctx) => {
+      await this.addCommandHandler.handleRelationSelection(ctx, 'CHILD');
+    });
+
+    this.bot.action('add_spouse', async (ctx) => {
+      await this.addCommandHandler.handleRelationSelection(ctx, 'SPOUSE');
+    });
   }
 
-  private async handleBirthYearInput(ctx: Context, text: string, state: UserState, chatId: string) {
-    try {
-      if (!state.data.relationType) {
-        this.logger.error('Relation type is missing in state');
-        await ctx.reply(
-          '❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.',
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '🔄 Qaytadan urinib ko\'rish', callback_data: 'add_new' }],
-                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
-              ]
-            }
+  private setupMessageHandlers() {
+    this.bot.on('text', async (ctx) => {
+      if (!ctx.from) return;
+
+      const telegramId = ctx.from.id.toString();
+      const state = this.stateService.getState(telegramId);
+
+      if (!state) return;
+
+      switch (state.action) {
+        case 'adding_member':
+          switch (state.step) {
+            case 'enter_name':
+              await this.addCommandHandler.handleNameInput(ctx, ctx.message.text);
+              break;
+            case 'enter_birth_year':
+              await this.addCommandHandler.handleBirthYearInput(ctx, ctx.message.text);
+              break;
           }
-        );
-        return;
+          break;
+        case 'searching':
+          // Handle search input
+          break;
       }
-
-      const birthYear = parseInt(text);
-      if (isNaN(birthYear) || birthYear < 1900 || birthYear > new Date().getFullYear()) {
-        await ctx.reply(
-          '❌ Noto\'g\'ri yil kiritildi. Iltimos, 1900-yildan hozirgi yilgacha bo\'lgan yilni kiriting:',
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]
-              ]
-            }
-          }
-        );
-        return;
-      }
-
-      const user = await this.getUser(chatId);
-      this.logger.debug(`User family members count: ${user.familyMembers.length}`);
-
-      if (!user.familyMembers.length) {
-        // If this is the first family member, create it without relation
-        try {
-          if (!state.data.name) {
-            throw new Error('Name is required');
-          }
-
-          const newMember = await this.prisma.familyMember.create({
-            data: {
-              fullName: state.data.name,
-              birthYear: birthYear,
-              relationType: state.data.relationType,
-              userId: user.id
-            }
-          });
-
-          this.stateService.clearState(chatId);
-          await ctx.reply(
-            '✅ Qarindosh muvaffaqiyatli qo\'shildi!',
-            {
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: '📝 Yangi qarindosh qo\'shish', callback_data: 'add_new' }],
-                  [{ text: '👀 Oila daraxtini ko\'rish', callback_data: 'view_tree' }]
-                ]
-              }
-            }
-          );
-          return;
-        } catch (error) {
-          this.logger.error(`Error creating first family member: ${error.message}`, error.stack);
-          await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
-          return;
-        }
-      }
-
-      // If there are existing family members, proceed with relation selection
-      this.stateService.setState(chatId, {
-        action: 'adding_member',
-        step: 'select_related_member',
-        data: {
-          ...state.data,
-          birthYear
-        }
-      });
-
-      const keyboard = user.familyMembers.map(member => [{
-        text: `${member.fullName} (${member.birthYear})`,
-        callback_data: `select_member_${member.id}`
-      }]);
-
-      keyboard.push([{ text: '⬅️ Orqaga', callback_data: 'back_to_main' }]);
-
-      await ctx.reply(
-        '👥 Qarindoshni kimga bog\'lamoqchisiz?',
-        {
-          reply_markup: {
-            inline_keyboard: keyboard
-          }
-        }
-      );
-    } catch (error) {
-      this.logger.error(`Error in handleBirthYearInput: ${error.message}`, error.stack);
-      await ctx.reply('❌ Xatolik yuz berdi. Iltimos, qaytadan urinib ko\'ring.');
-    }
+    });
   }
 
   private getRelationName(relationType: RelationType | undefined): string {
@@ -1579,5 +1469,14 @@ export class TelegramService implements OnModuleInit {
       siblings: members.filter(m => m.relationType === RelationType.SIBLING).length,
       spouses: members.filter(m => m.relationType === RelationType.SPOUSE).length
     };
+  }
+
+  private getFontSizeLabel(size: string): string {
+    switch (size) {
+      case 'small': return 'Kichik';
+      case 'medium': return 'O\'rta';
+      case 'large': return 'Katta';
+      default: return 'O\'rta';
+    }
   }
 } 
